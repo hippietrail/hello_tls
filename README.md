@@ -1,6 +1,6 @@
 # Hello TLS!
 
-This is a pure Python, dependency-less\* implementation of SSL/TLS Client Hello and basic scaning.
+This is a pure Python, dependency-less\* implementation of SSL/TLS Client Hello and basic scanning.
 
 Its purpose is to quickly discover what cipher suites and SSL/TLS protocols are enabled on a server. Since the server doesn't advertise this list, instead picking from what is offered by the client, hello_tls.py sends a sequence of Client Hello with different cipher suite and protocol combinations. It usually needs less than 8 requests and 300 ms, but for servers with many cipher suites or high latency, bumping `max_workers` splits discovery over many threads.
 
