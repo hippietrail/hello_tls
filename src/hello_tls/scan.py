@@ -28,6 +28,10 @@ class ProxyError(ConnectionError):
     """ Class for errors in connecting through a proxy. """
     pass
 
+class EmptyServerResponse(ScanError):
+    """ Error for servers that close the connection without sending any data. """
+    pass
+
 @dataclasses.dataclass
 class ConnectionSettings:
     """
@@ -81,8 +85,27 @@ def send_hello(connection_settings: ConnectionSettings, client_hello: ClientHell
     sock = make_socket(connection_settings)
     sock.send(make_client_hello(client_hello))
 
-    packet_stream = iter(lambda: sock.recv(4096), b'')
-    server_hello = parse_server_hello(packet_stream)
+    def packet_stream() -> Iterator[bytes]:
+        bytes_read = 0
+        while True:
+            try:
+                packet = sock.recv(4096)
+            except (TimeoutError, ConnectionResetError) as e:
+                # tiktok.com times out when no matching groups are found.
+                # live.com sends a RST packet when no matching protocols are found.
+                raise EmptyServerResponse() from e
+            bytes_read += len(packet)
+            if packet:
+                yield packet
+            elif bytes_read == 0:
+                raise EmptyServerResponse()
+            else:
+                break
+
+    try:
+        server_hello = parse_server_hello(packet_stream())
+    except ValueError as e:
+        raise BadServerResponse('Error parsing server response') from e
     
     if server_hello.version not in client_hello.protocols:
         # Server picked a protocol we didn't ask for.
@@ -90,6 +113,18 @@ def send_hello(connection_settings: ConnectionSettings, client_hello: ClientHell
         raise DowngradeError(f"Server attempted to downgrade from {client_hello.protocols} to {server_hello.version}")
     
     return server_hello
+
+def try_send_hello(connection_settings: ConnectionSettings, client_hello: ClientHello) -> Optional[ServerHello]:
+    """
+    Identical to `send_hello` but returns None instead of raising errors when the connection is cleanly rejected.
+    """
+    try:
+        return send_hello(connection_settings, client_hello)
+    except (ServerAlertError, DowngradeError, EmptyServerResponse) as e:
+        # ServerAlertError could technically be raised for a variety of reasons, but in practice
+        # there's too much variation on how servers pick Alert Descriptions to reject a handshake.
+        logger.debug(f'Server responded with error {e!r}')
+        return None
 
 def _iterate_server_option(connection_settings: ConnectionSettings, client_hello: ClientHello, request_option: str, response_option: str, on_response: Callable[[ServerHello], None] = lambda s: None) -> Iterator[Any]:
     """
@@ -104,16 +139,14 @@ def _iterate_server_option(connection_settings: ConnectionSettings, client_hello
     logger.info(f"Enumerating server {response_option} with {len(options_to_test)} options and protocols {client_hello.protocols}")
 
     while options_to_test:
-        try:
-            logger.debug(f"Offering {len(options_to_test)} {response_option} over {client_hello.protocols}: {options_to_test}")
-            server_hello = send_hello(connection_settings, client_hello)
-            on_response(server_hello)
-        except DowngradeError:
+        logger.debug(f"Offering {len(options_to_test)} {response_option} over {client_hello.protocols}: {options_to_test}")
+
+        server_hello = try_send_hello(connection_settings, client_hello)
+
+        if not server_hello:
             break
-        except ServerAlertError as error:
-            if error.description in [AlertDescription.protocol_version, AlertDescription.handshake_failure]:
-                break
-            raise
+
+        on_response(server_hello)
 
         accepted_option = getattr(server_hello, response_option)
         if accepted_option is None or accepted_option not in options_to_test:
@@ -158,13 +191,25 @@ class Certificate:
     days_until_expiration: int
     signature_algorithm: str
     extensions: dict[str, str]
-    
-def get_server_certificate_chain(connection_settings: ConnectionSettings, client_hello: ClientHello) -> Iterable[Certificate]:
+    pem: str
+
+@dataclasses.dataclass
+class OpenSSLResponse:
     """
-    Use socket and pyOpenSSL to get the server certificate chain.
+    Represents all useful scan data extracted from a pyOpenSSL handshake.
+    """
+    # Certificate chain offered by the server.
+    server_certificate_chain: list[Certificate]
+    # List of CA's accepted for client certificates, as dictionary of X509 names.
+    client_ca_names: list[dict]
+
+def get_openssl_response(connection_settings: ConnectionSettings, client_hello: ClientHello) -> OpenSSLResponse:
+    """
+    Uses pyOpenSSL for a TLS handshake. Is not as accepting as the pure-Python implementation, but is capable
+    of reading encrypted packets like the certificate chain.
     """
     from OpenSSL import SSL, crypto
-    import ssl, select
+    import select
 
     def _x509_name_to_dict(x509_name: crypto.X509Name) -> dict[str, str]:
         return {name.decode('utf-8'): value.decode('utf-8') for name, value in x509_name.get_components()}
@@ -173,6 +218,46 @@ def get_server_certificate_chain(connection_settings: ConnectionSettings, client
         if x509_time is None:
             raise BadServerResponse('Timestamp cannot be None')
         return datetime.strptime(x509_time.decode('ascii'), '%Y%m%d%H%M%SZ').replace(tzinfo=timezone.utc)
+
+    def raw_openssl_cert_to_certificate(raw_cert, current_date: datetime) -> Certificate:
+        """
+        Converts a "raw" pyOpenSSL certificate into our Certificate dataclass.
+        """
+        _public_key_type_by_openssl_id = {crypto.TYPE_DH: 'DH', crypto.TYPE_DSA: 'DSA', crypto.TYPE_EC: 'EC', crypto.TYPE_RSA: 'RSA'}
+
+        extensions: dict[str, str] = {}
+        for i in range(raw_cert.get_extension_count()):
+            extension = raw_cert.get_extension(i)
+            try:
+                value = str(extension)
+            except crypto.Error:
+                value = extension.get_data().hex(':')
+            extensions[extension.get_short_name().decode('utf-8')] = value
+
+        san = re.findall(r'DNS:(.+?)(?:, |$)', extensions.get('subjectAltName', ''))
+
+        all_key_usage_str = extensions.get('keyUsage', '') + ', ' + extensions.get('extendedKeyUsage', '')
+        all_key_usage = [ku for ku in all_key_usage_str.split(', ') if ku]
+        not_after = _x509_time_to_datetime(raw_cert.get_notAfter())
+        days_until_expiration = (not_after - current_date).days
+
+        return Certificate(
+            pem=crypto.dump_certificate(crypto.FILETYPE_PEM, raw_cert).decode('utf-8'),
+            serial_number=str(raw_cert.get_serial_number()),
+            subject=_x509_name_to_dict(raw_cert.get_subject()),
+            issuer=_x509_name_to_dict(raw_cert.get_issuer()),
+            subject_alternative_names=san,
+            not_before=_x509_time_to_datetime(raw_cert.get_notBefore()),
+            not_after=not_after,
+            signature_algorithm=raw_cert.get_signature_algorithm().decode('utf-8'),
+            extensions=extensions,
+            key_length_in_bits=raw_cert.get_pubkey().bits(),
+            key_type=_public_key_type_by_openssl_id.get(raw_cert.get_pubkey().type(), 'UNKNOWN'),
+            fingerprint_sha256=raw_cert.digest('sha256').decode('utf-8'),
+            all_key_usage=all_key_usage,
+            is_expired=raw_cert.has_expired(),
+            days_until_expiration=days_until_expiration,
+        )
     
     no_flag_by_protocol = {
         Protocol.SSLv3: SSL.OP_NO_SSLv3,
@@ -191,7 +276,8 @@ def get_server_certificate_chain(connection_settings: ConnectionSettings, client
         connection = SSL.Connection(context, sock)
         connection.set_connect_state()        
         # Necessary for servers that expect SNI. Otherwise expect "tlsv1 alert internal error".
-        connection.set_tlsext_host_name((client_hello.server_name or connection_settings.host).encode('utf-8'))
+        if client_hello.server_name is not None:
+            connection.set_tlsext_host_name(client_hello.server_name.encode('utf-8'))
         while True:
             try:
                 connection.do_handshake()
@@ -201,47 +287,31 @@ def get_server_certificate_chain(connection_settings: ConnectionSettings, client
                 if not rd:
                     raise ConnectionError('Timed out during handshake for certificate chain') from e
                 continue
-            except SSL.Error as e:
+            except (SSL.Error, SSL.SysCallError) as e:
+                # live.com sends a RST packet when no matching protocols are found.
                 raise ConnectionError(f'OpenSSL exception during handshake for certificate chain: {e}') from e
         connection.shutdown()
 
     raw_certs = connection.get_peer_cert_chain()
+    raw_client_ca_names = connection.get_client_ca_list()
 
     if raw_certs is None:
         raise BadServerResponse('Server did not give any certificate chain')
     
-    logger.info(f"Received {len(raw_certs)} certificates")
+    logger.info(f"Received {len(raw_certs)} certificates and {len(raw_client_ca_names)} client CA's")
+
+    return OpenSSLResponse(
+        server_certificate_chain=[raw_openssl_cert_to_certificate(raw_cert, connection_settings.date) for raw_cert in raw_certs],
+        client_ca_names=[_x509_name_to_dict(raw_client_ca_name) for raw_client_ca_name in raw_client_ca_names],
+        # TODO: can we include ALPN protocol in response? I haven't found a public server to test it yet.
+        #alpn_proto_negotiated=connection.get_alpn_proto_negotiated(),
+    )    
     
-    public_key_type_by_id = {crypto.TYPE_DH: 'DH', crypto.TYPE_DSA: 'DSA', crypto.TYPE_EC: 'EC', crypto.TYPE_RSA: 'RSA'}
-    for raw_cert in raw_certs:
-        extensions: dict[str, str] = {}
-        for i in range(raw_cert.get_extension_count()):
-            extension = raw_cert.get_extension(i)
-            extensions[extension.get_short_name().decode('utf-8')] = str(extension)
-
-        san = re.findall(r'DNS:(.+?)(?:, |$)', extensions.get('subjectAltName', ''))
-
-        all_key_usage_str = extensions.get('keyUsage', '') + ', ' + extensions.get('extendedKeyUsage', '')
-        all_key_usage = [ku for ku in all_key_usage_str.split(', ') if ku]
-        not_after = _x509_time_to_datetime(raw_cert.get_notAfter())
-        days_until_expiration = (not_after - connection_settings.date).days
-
-        yield Certificate(
-            serial_number=str(raw_cert.get_serial_number()),
-            subject=_x509_name_to_dict(raw_cert.get_subject()),
-            issuer=_x509_name_to_dict(raw_cert.get_issuer()),
-            subject_alternative_names=san,
-            not_before=_x509_time_to_datetime(raw_cert.get_notBefore()),
-            not_after=not_after,
-            signature_algorithm=raw_cert.get_signature_algorithm().decode('utf-8'),
-            extensions=extensions,
-            key_length_in_bits=raw_cert.get_pubkey().bits(),
-            key_type=public_key_type_by_id.get(raw_cert.get_pubkey().type(), 'UNKNOWN'),
-            fingerprint_sha256=raw_cert.digest('sha256').decode('utf-8'),
-            all_key_usage=all_key_usage,
-            is_expired=raw_cert.has_expired(),
-            days_until_expiration=days_until_expiration,
-        )
+def get_server_certificate_chain(connection_settings: ConnectionSettings, client_hello: ClientHello) -> Iterable[Certificate]:
+    """
+    Use socket and pyOpenSSL to get the server certificate chain.
+    """
+    return get_openssl_response(connection_settings, client_hello).server_certificate_chain
 
 @dataclasses.dataclass
 class ProtocolResult:
@@ -261,6 +331,9 @@ class ProtocolResult:
 class ServerScanResult:
     connection: ConnectionSettings
     protocols: dict[Protocol, Optional[ProtocolResult]]
+    requires_sni: Optional[bool]
+    accepts_bad_sni: Optional[bool]
+    client_ca_names: list[dict]
     certificate_chain: list[Certificate]
 
 def scan_server(
@@ -268,6 +341,7 @@ def scan_server(
     client_hello: Optional[ClientHello] = None,
     do_enumerate_cipher_suites: bool = True,
     do_enumerate_groups: bool = True,
+    do_test_sni: bool = True,
     fetch_cert_chain: bool = True,
     max_workers: int = DEFAULT_MAX_WORKERS,
     progress: Callable[[int, int], None] = lambda current, total: None,
@@ -287,8 +361,16 @@ def scan_server(
     if not client_hello:
         client_hello = ClientHello(server_name=connection_settings.host)            
 
-    tmp_certificate_chain: List[Certificate] = []
     tmp_protocol_results = {p: ProtocolResult(False, None, None, None, None) for p in Protocol}
+
+    result = ServerScanResult(
+        connection=connection_settings,
+        protocols={},
+        certificate_chain=[],
+        client_ca_names=[],
+        requires_sni=None,
+        accepts_bad_sni=None
+    )
 
     with ThreadPool(max_workers) as pool:
         logger.debug("Initializing workers")
@@ -319,8 +401,22 @@ def scan_server(
             # Must be extracted to a function to avoid late binding in task lambdas.
             scan_protocol(protocol)
 
+        if do_test_sni:
+            # Send Client Hello with missing/wrong SNI.
+            def task():
+                logger.debug(f"Sending Client Hello with no Server Name Indication")
+                result.requires_sni = not try_send_hello(connection_settings, dataclasses.replace(client_hello, server_name=None))
+
+                logger.debug(f"Sending Client Hello with bad Server Name Indication")
+                result.accepts_bad_sni = bool(try_send_hello(connection_settings, dataclasses.replace(client_hello, server_name='bad-sni.example.com')))
+            tasks.append(task)
+
         if fetch_cert_chain:
-            tasks.append(lambda: tmp_certificate_chain.extend(get_server_certificate_chain(connection_settings, client_hello)))
+            def do_openssl_handshake():
+                openssl_response = get_openssl_response(connection_settings, client_hello)
+                result.client_ca_names = openssl_response.client_ca_names
+                result.certificate_chain = openssl_response.server_certificate_chain
+            tasks.append(do_openssl_handshake)
 
         if max_workers > len(tasks):
             logger.warning(f'Max workers is {max_workers}, but only {len(tasks)} tasks were ever created')
@@ -329,12 +425,6 @@ def scan_server(
         for i, _ in enumerate(pool.imap_unordered(lambda t: t(), tasks)):
             progress(i+1, len(tasks))
 
-    result = ServerScanResult(
-        connection=connection_settings,
-        protocols={},
-        certificate_chain=tmp_certificate_chain,
-    )
-
     # Finish processing the Server Hellos to detect compression and cipher suite order.
     for protocol, protocol_result in tmp_protocol_results.items():
         if not protocol_result.cipher_suites and not protocol_result.groups:
@@ -342,7 +432,7 @@ def scan_server(
             continue
 
         result.protocols[protocol] = protocol_result
-
+        
         sample_hello = (protocol_result._cipher_suite_hellos or protocol_result._group_hellos)[0]
         protocol_result.has_compression = sample_hello.compression != CompressionMethod.NULL
 

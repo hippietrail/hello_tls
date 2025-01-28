@@ -24,28 +24,10 @@ class BadServerResponse(ScanError):
 @dataclass
 class ServerHello:
     version: Protocol
+    is_retry_request: bool
     compression: CompressionMethod
     cipher_suite: CipherSuite
     group: Optional[Group]
-
-def _make_stream_parser(packets: Iterable[bytes]) -> Tuple[Callable[[int], bytes], Callable[[], int]]:
-    """
-    Returns helper functions to parse a stream of packets.
-    """
-    start = 0
-    packets_iter = iter(packets)
-    data = b''
-    def read_next(length: int) -> bytes:
-        nonlocal start, data
-        while start + length > len(data):
-            try:
-                data += next(packets_iter)
-            except StopIteration:
-                raise BadServerResponse('Server response ended unexpectedly')
-        value = data[start:start+length]
-        start += length
-        return value
-    return read_next, lambda: start
 
 def _bytes_to_int(b: bytes) -> int:
     return int.from_bytes(b, byteorder='big')
@@ -54,36 +36,67 @@ def parse_server_hello(packets: Iterable[bytes]) -> ServerHello:
     """
     Parses a Server Hello packet and returns the cipher suite accepted by the server.
     """
-    read_next, current_position = _make_stream_parser(packets)
+    start = 0
+    packets_iter = iter(packets)
+    data = next(packets_iter) # Buffer first packet.
+    def read_next(length: int) -> bytes:
+        """ Returns the next `length` unparsed bytes. """
+        nonlocal start, data
+        while start + length > len(data):
+            try:
+                # This is quadratic, but there are few packets to loop over.
+                data += next(packets_iter)
+            except StopIteration:
+                raise BadServerResponse('Server response ended unexpectedly')
+        value = data[start:start+length]
+        start += length
+        return value
     
+    if data.startswith(b'HTTP/'):
+        raise BadServerResponse('Server responded with plaintext HTTP, not TLS', data)
+
     record_type = RecordType(read_next(1))
     legacy_record_version = read_next(2)
     record_length = _bytes_to_int(read_next(2))
-    record_end = current_position() + record_length
+    record_end = start + record_length
     if record_type == RecordType.ALERT:
         # Server responded with an error.
         alert_level = AlertLevel(read_next(1))
         alert_description = AlertDescription(read_next(1))
         raise ServerAlertError(alert_level, alert_description)
     
-    assert record_type == RecordType.HANDSHAKE, record_type
+    if record_type != RecordType.HANDSHAKE:
+        raise BadServerResponse(f'Server responded with unexpected Record Type, expected {RecordType.HANDSHAKE} but got {record_type}')
+    
     handshake_type = HandshakeType(read_next(1))
     assert handshake_type == HandshakeType.server_hello, handshake_type
     server_hello_length = _bytes_to_int(read_next(3))
     # At most TLS 1.2. Handshakes for TLS 1.3 use the supported_versions extension.
     version = Protocol(read_next(2))
     server_random = read_next(32)
+
+    # Magic value meaning Hello Retry Request (see https://datatracker.ietf.org/doc/html/rfc8446#section-4.1.4 ).
+    # It's an error, but represented in server_random to maintain backwards compatibility.
+    is_retry_request = server_random == b'\xCF\x21\xAD\x74\xE5\x9A\x61\x11\xBE\x1D\x8C\x02\x1E\x65\xB8\x91\xC2\xA2\x11\x16\x7A\xBB\x8C\x5E\x07\x9E\x09\xE2\xC8\xA8\x33\x9C'
+
     session_id_length = read_next(1)
     session_id = read_next(_bytes_to_int(session_id_length))
     cipher_suite = CipherSuite(read_next(2))
     compression_method = CompressionMethod(read_next(1))
-    extensions_length = _bytes_to_int(read_next(2))
-    extensions_end = current_position() + extensions_length
+    if start + 2 <= record_end:
+        extensions_length = _bytes_to_int(read_next(2))
+    else: # extensions may not be present in TLS 1.2 and lower
+        extensions_length = 0
+    extensions_end = start + extensions_length
 
     group = None
 
-    while current_position() < extensions_end:
-        extension_type = ExtensionType(read_next(2))
+    while start < extensions_end:
+        try:
+            extension_type = ExtensionType(read_next(2))
+        except ValueError:
+            # Ignore unknown extensions.
+            continue
         extension_data_length = read_next(2)
         extension_data = read_next(_bytes_to_int(extension_data_length))
         if extension_type == ExtensionType.supported_versions:
@@ -95,7 +108,7 @@ def parse_server_hello(packets: Iterable[bytes]) -> ServerHello:
                 logger.warning(f'Unknown group: {extension_data[:2]!r}')
                 pass
     
-    return ServerHello(version, compression_method, cipher_suite, group)
+    return ServerHello(version, is_retry_request, compression_method, cipher_suite, group)
 
 @dataclass
 class ClientHello:
@@ -230,12 +243,15 @@ def make_client_hello(client_hello: ClientHello) -> bytes:
                     with prefix_length('pre_shared_key_modes list', width_bytes=1):
                         octets.extend(PskKeyExchangeMode.psk_dhe_ke.value)
 
+                # Add empty key_share extension
+                # https://datatracker.ietf.org/doc/html/rfc8446#section-4.2.8
+                # "This vector MAY be empty if the client is requesting a HelloRetryRequest. ... Clients MUST
+                # NOT offer any KeyShareEntry values for groups not listed in the client's "supported_groups"
+                # extension. Servers MAY check for violations of these rules and abort the handshake with an
+                # "illegal_parameter" alert if one is violated."
                 octets.extend(ExtensionType.key_share.value)
                 with prefix_length('key_share extension'):
                     with prefix_length('key share bytes'):
-                        octets.extend(Group.x25519.value)
-                        with prefix_length('pre shared key public key'):
-                            # Shamelessly stolen from https://tls13.xargs.org/#client-hello/annotated
-                            octets.extend([0x35, 0x80, 0x72, 0xd6, 0x36, 0x58, 0x80, 0xd1, 0xae, 0xea, 0x32, 0x9a, 0xdf, 0x91, 0x21, 0x38, 0x38, 0x51, 0xed, 0x21, 0xa2, 0x8e, 0x3b, 0x75, 0xe9, 0x65, 0xd0, 0xd2, 0xcd, 0x16, 0x62, 0x54])
+                        pass
 
     return bytes(octets)
